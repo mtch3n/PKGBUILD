@@ -1,0 +1,94 @@
+name: Build and Deploy Repo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: build-and-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux/archlinux:base-devel
+    steps:
+      - name: Setup system
+        run: |
+          pacman -Syu --noconfirm --needed git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Install package dependencies
+        run: |
+          pacman -S --noconfirm --needed \
+            libxkbfile gnupg gtk3 libsecret nss gcc-libs libnotify libxss \
+            glibc lsof shared-mime-info xdg-utils alsa-lib
+
+      - name: Build packages
+        run: |
+          mkdir -p /build/repo
+          for pkgdir in packages/*/; do
+            if [ -f "$pkgdir/PKGBUILD" ]; then
+              echo "::group::Building $(basename "$pkgdir")"
+              cp -r "$pkgdir" /build/pkg
+              chown -R builder:builder /build/pkg
+
+              cd /build/pkg
+              sudo -u builder makepkg -s --noconfirm --skippgpcheck
+              cp *.pkg.tar.zst /build/repo/ 2>/dev/null || true
+              cd /
+              rm -rf /build/pkg
+              echo "::endgroup::"
+            fi
+          done
+
+      - name: Create repo database
+        run: |
+          cd /build/repo
+          repo-add mtch3n.db.tar.gz *.pkg.tar.zst
+
+          # repo-add creates symlinks; GitHub Pages needs real files
+          for link in mtch3n.db mtch3n.files; do
+            if [ -L "$link" ]; then
+              target=$(readlink "$link")
+              rm "$link"
+              cp "$target" "$link"
+            fi
+          done
+
+          ls -la
+
+      - name: Prepare Pages directory
+        run: |
+          mkdir -p /build/pages/x86_64
+          cp /build/repo/* /build/pages/x86_64/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: /build/pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4

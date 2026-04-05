@@ -1,0 +1,88 @@
+name: Update VS Code Insiders
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "12 * * * *"
+
+concurrency:
+  group: update-vscode-insiders
+  cancel-in-progress: false
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for new version
+        id: check
+        run: |
+          pkgdir="packages/visual-studio-code-insiders-bin"
+          version_current=$(awk '/^pkgver=/ {print $0}' "$pkgdir/PKGBUILD" | cut -d= -f2)
+
+          if [ -z "$version_current" ]; then
+            echo "::error::Could not parse current pkgver"
+            exit 1
+          fi
+          echo "Current version: $version_current"
+
+          # Follow Microsoft's redirect to get latest download URL and version
+          url=$(curl -ILs -o /dev/null -w '%{url_effective}' \
+            'https://code.visualstudio.com/sha/download?build=insider&os=linux-x64')
+
+          if [ -z "$url" ]; then
+            echo "::error::Could not resolve download URL"
+            exit 1
+          fi
+
+          # Extract version (timestamp) from URL like: .../code-insider-x64-1775236085.tar.gz
+          version_new=$(echo "$url" | grep -oP 'code-insider-x64-\K[0-9]+')
+
+          if [ -z "$version_new" ]; then
+            echo "::error::Could not parse version from URL: $url"
+            exit 1
+          fi
+
+          echo "Latest version: $version_new"
+
+          if [ "$version_current" = "$version_new" ]; then
+            echo "::notice::Already up to date at $version_current"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::notice::Version changed $version_current -> $version_new"
+
+          # Update PKGBUILD source URL for x86_64
+          sed -i "s|^pkgver=.*|pkgver=$version_new|" "$pkgdir/PKGBUILD"
+          sed -i "s|^pkgrel=.*|pkgrel=1|" "$pkgdir/PKGBUILD"
+          sed -i "s|^source_x86_64=.*|source_x86_64=(code_x64_${version_new}.tar.gz::${url})|" "$pkgdir/PKGBUILD"
+
+          # Update sha256sums for the new tarball
+          echo "Downloading tarball to compute checksum..."
+          sha256_x64=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+          sed -i "s|^sha256sums_x86_64=.*|sha256sums_x86_64=('$sha256_x64')|" "$pkgdir/PKGBUILD"
+
+          # Update common source files checksums (desktop files etc)
+          sha_desktop=$(curl -sL "https://raw.githubusercontent.com/microsoft/vscode/master/resources/linux/code.desktop" | sha256sum | cut -d' ' -f1)
+          sha_url_handler=$(curl -sL "https://raw.githubusercontent.com/microsoft/vscode/master/resources/linux/code-url-handler.desktop" | sha256sum | cut -d' ' -f1)
+          sha_workspace=$(curl -sL "https://raw.githubusercontent.com/microsoft/vscode/master/resources/linux/code-workspace.xml" | sha256sum | cut -d' ' -f1)
+          sha_launcher=$(sha256sum "$pkgdir/visual-studio-code-insiders-bin.sh" | cut -d' ' -f1)
+
+          sed -i "s|^sha256sums=.*|sha256sums=('$sha_desktop'\n            '$sha_url_handler'\n            '$sha_workspace'\n            '$sha_launcher')|" "$pkgdir/PKGBUILD"
+
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "new_version=$version_new" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.check.outputs.updated == 'true'
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/visual-studio-code-insiders-bin/PKGBUILD
+          git commit -m "visual-studio-code-insiders-bin: update to $NEW_VERSION"
+          git push
